@@ -57,7 +57,6 @@ def fq(name: str) -> str:
 TABLES: Dict[str, str] = {
     "conversation_events": fq("conversation_events"),
     "profile_memory_audit": fq("profile_memory_audit"),
-    "llm_errors": fq("profile_memory_llm_errors"),
     "current_view": fq("v_profile_memory_current"),
 }
 

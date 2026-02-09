@@ -19,10 +19,10 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
-from pyspark.sql import Row, functions as F
+from pyspark.sql import Row
 from pyspark.sql.types import (
     ArrayType,
     DoubleType,
@@ -72,19 +72,32 @@ def clip_text(value: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
     return text[:max_chars]
 
 
-def get_workspace_host() -> str:
-    host = os.environ.get("DATABRICKS_HOST")
-    if host:
-        return host.replace("https://", "").strip("/")
-    return spark.conf.get("spark.databricks.workspaceUrl", "")
+def resolve_runtime_auth() -> Tuple[str, str]:
+    host = os.environ.get("DATABRICKS_HOST", "").replace("https://", "").strip("/")
+    token = os.environ.get("DATABRICKS_TOKEN", "").strip()
+
+    # Driver-side Databricks context fallback.
+    try:
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        if not host:
+            host = ctx.apiUrl().get().replace("https://", "").strip("/")
+        if not token:
+            token = ctx.apiToken().get()
+    except Exception:
+        pass
+
+    return host, token
+
+
+RUNTIME_WORKSPACE_HOST, RUNTIME_DATABRICKS_TOKEN = resolve_runtime_auth()
 
 
 def get_llm_client() -> Optional["OpenAI"]:
     if OpenAI is None:
         return None
 
-    host = get_workspace_host()
-    token = os.environ.get("DATABRICKS_TOKEN")
+    host = RUNTIME_WORKSPACE_HOST
+    token = RUNTIME_DATABRICKS_TOKEN
     if not host or not token:
         return None
 
@@ -98,14 +111,28 @@ def get_llm_client() -> Optional["OpenAI"]:
 
 def system_prompt() -> str:
     return (
-        "You extract durable user profile facts from chat history. "
-        "Compare incoming messages with current facts and return strict JSON only.\n"
-        "Schema:\n"
-        "{"
-        '"facts":[{"key":"snake_case","kind":"preference|identity|project|constraint",'
-        '"value":"short value","confidence":0.0,"action":"new|updated|unchanged|deleted"}]'
-        "}\n"
-        "Rules: durable facts only, no ephemeral details, max 30 facts, keep values short."
+        "You extract durable profile memory facts for one user. "
+        "Return strict JSON only with no extra prose.\n\n"
+        "Output schema:\n"
+        "{\n"
+        '  "facts": [\n'
+        "    {\n"
+        '      "key": "snake_case_key",\n'
+        '      "kind": "preference|identity|project|constraint",\n'
+        '      "value": "short string under 100 chars",\n'
+        '      "confidence": 0.0,\n'
+        '      "action": "new|updated|unchanged|deleted",\n'
+        '      "reason": "short justification"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Durable facts only; ignore ephemeral details.\n"
+        "- Keep keys canonical snake_case.\n"
+        "- Include unchanged facts when still valid.\n"
+        "- If a fact contradicts existing facts, use action=updated.\n"
+        "- Use action=deleted when a prior fact is no longer valid.\n"
+        "- Max 30 facts."
     )
 
 
@@ -161,13 +188,30 @@ def heuristic_extract(messages: List[Dict[str, str]], current_facts: Dict[str, D
     joined = " ".join([m.get("content", "").lower() for m in messages if m.get("role") == "user"])
 
     checks = [
+        ("job_role", "identity", "Data engineer", "data engineer"),
+        ("job_role", "identity", "Product manager", "product manager"),
+        ("job_role", "identity", "Frontend engineer", "frontend engineer"),
+        ("company_domain", "identity", "Fintech", "fintech"),
         ("preferred_language", "preference", "Python", "prefer python"),
         ("preferred_language", "preference", "Python and Rust", "python daily, now together with rust"),
+        ("project_migration_status", "project", "In progress", "migrating legacy hive tables to delta lake"),
+        ("project_migration_status", "project", "Complete", "migration project is now complete"),
+        ("orchestration_tool", "project", "Airflow", "uses airflow for orchestration"),
+        ("interest_topic", "preference", "Kafka Connect", "kafka connect"),
         ("location", "identity", "San Francisco", "san francisco"),
-        ("location", "identity", "Austin", "relocated to austin"),
         ("location", "identity", "Brooklyn", "live in brooklyn"),
-        ("diet", "identity", "Vegan", "i am vegan"),
+        ("location", "identity", "Austin", "relocated to austin"),
+        ("travel_plan", "project", "Japan in April", "trip to japan in april"),
         ("response_style", "preference", "Concise bullet points", "concise bullet-point responses"),
+        ("pet_name", "identity", "Beau", "dog named beau"),
+        ("interest_topic", "preference", "Real estate investing", "real estate investing"),
+        ("side_project", "project", "Wedding planning app", "wedding planning app"),
+        ("tech_stack", "project", "React Native", "react native"),
+        ("diet", "identity", "Vegan", "i am vegan"),
+        ("travel_seat_preference", "preference", "Window seat", "prefer window seats"),
+        ("life_event", "identity", "Getting married in October", "getting married in october"),
+        ("partner_name", "identity", "Riley", "partner's name is riley"),
+        ("interest_topic", "preference", "Accessibility best practices", "accessibility best practices"),
     ]
     for key, kind, value, needle in checks:
         if needle in joined:
@@ -184,33 +228,38 @@ def heuristic_extract(messages: List[Dict[str, str]], current_facts: Dict[str, D
     return {"facts": list(updates.values())}
 
 
-def call_llm(client: Optional["OpenAI"], messages: List[Dict[str, str]], current_facts: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+def call_llm(
+    client: Optional["OpenAI"], messages: List[Dict[str, str]], current_facts: Dict[str, Dict[str, object]]
+) -> Tuple[Dict[str, object], Optional[str]]:
     if client is None:
-        return heuristic_extract(messages, current_facts)
+        return heuristic_extract(messages, current_facts), "llm_unavailable_heuristic_fallback"
 
     user_prompt = build_user_prompt(messages, current_facts)
-    response = client.chat.completions.create(
-        model=LLM_ENDPOINT,
-        messages=[
-            {"role": "system", "content": system_prompt()},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.1,
-    )
-    raw = (response.choices[0].message.content or "").strip()
     try:
-        return try_parse_response(raw)
-    except Exception:
-        repair = client.chat.completions.create(
+        response = client.chat.completions.create(
             model=LLM_ENDPOINT,
             messages=[
-                {"role": "system", "content": "Return valid JSON only. Keep same semantic meaning."},
-                {"role": "user", "content": raw},
+                {"role": "system", "content": system_prompt()},
+                {"role": "user", "content": user_prompt},
             ],
-            temperature=0.0,
+            temperature=0.1,
         )
-        repaired = (repair.choices[0].message.content or "").strip()
-        return try_parse_response(repaired)
+        raw = (response.choices[0].message.content or "").strip()
+        return try_parse_response(raw), None
+    except Exception:
+        try:
+            repair = client.chat.completions.create(
+                model=LLM_ENDPOINT,
+                messages=[
+                    {"role": "system", "content": "Return valid JSON only. Keep same semantic meaning."},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+            )
+            repaired = (repair.choices[0].message.content or "").strip()
+            return try_parse_response(repaired), "llm_primary_failed_repair_succeeded"
+        except Exception:
+            return heuristic_extract(messages, current_facts), "llm_failed_heuristic_fallback"
 
 # COMMAND ----------
 
@@ -303,7 +352,7 @@ class ProfileMemoryProcessor(StatefulProcessor):
         source_event_ids = [m["event_id"] for m in messages[-10:]]
 
         prior_facts = {k: v.asDict(recursive=True) for k, v in self.profile_facts.iterator()}
-        payload = call_llm(self.llm_client, messages, prior_facts)
+        payload, llm_status = call_llm(self.llm_client, messages, prior_facts)
 
         emission_id = str(uuid4())
         emission_ts = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -363,8 +412,23 @@ class ProfileMemoryProcessor(StatefulProcessor):
         for row in deleted_rows:
             yield row
 
+        if llm_status is not None:
+            yield Row(
+                user_id=user_id,
+                emission_id=emission_id,
+                emission_ts=emission_ts,
+                key="__llm_status__",
+                kind="constraint",
+                value=llm_status,
+                confidence=1.0,
+                action="deleted",
+                previous_value=None,
+                source_event_ids=source_event_ids,
+            )
+
         current = {k: v.asDict(recursive=True) for k, v in self.profile_facts.iterator()}
         for key, fact in current.items():
+            action = action_by_key.get(key, "unchanged")
             yield Row(
                 user_id=user_id,
                 emission_id=emission_id,
@@ -373,8 +437,12 @@ class ProfileMemoryProcessor(StatefulProcessor):
                 kind=fact["kind"],
                 value=fact["value"],
                 confidence=float(fact["confidence"]),
-                action=action_by_key.get(key, "unchanged"),
-                previous_value=None if prior_facts.get(key) is None else prior_facts[key].get("value"),
+                action=action,
+                previous_value=(
+                    prior_facts[key].get("value")
+                    if action == "updated" and prior_facts.get(key) is not None
+                    else None
+                ),
                 source_event_ids=source_event_ids,
             )
 

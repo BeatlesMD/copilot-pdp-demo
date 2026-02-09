@@ -137,11 +137,12 @@ events_df = spark.createDataFrame(events)
 target = TABLES["conversation_events"]
 existing = spark.table(target).select("event_id")
 to_insert = events_df.alias("n").join(existing.alias("e"), on="event_id", how="left_anti")
+rows_to_insert = to_insert.count()
 
 to_insert.write.mode("append").format("delta").saveAsTable(target)
 
 print("Rows prepared:", events_df.count())
-print("Rows inserted:", to_insert.count())
+print("Rows inserted:", rows_to_insert)
 
 # COMMAND ----------
 

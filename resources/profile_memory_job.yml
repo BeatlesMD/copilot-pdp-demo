@@ -7,7 +7,7 @@ resources:
         - task_key: task00_config
           existing_cluster_id: ${var.cluster_id}
           notebook_task:
-            notebook_path: ../notebooks/00_config.py
+            notebook_path: notebooks/00_config.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${var.schema}
@@ -20,7 +20,7 @@ resources:
             - task_key: task00_config
           existing_cluster_id: ${var.cluster_id}
           notebook_task:
-            notebook_path: ../notebooks/01_setup_tables.py
+            notebook_path: notebooks/01_setup_tables.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${var.schema}
@@ -33,7 +33,7 @@ resources:
             - task_key: task01_setup_tables
           existing_cluster_id: ${var.cluster_id}
           notebook_task:
-            notebook_path: ../notebooks/02_generate_data.py
+            notebook_path: notebooks/02_generate_data.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${var.schema}
@@ -46,7 +46,7 @@ resources:
             - task_key: task02_generate_data
           existing_cluster_id: ${var.cluster_id}
           notebook_task:
-            notebook_path: ../notebooks/03_profile_memory_pipeline.py
+            notebook_path: notebooks/03_profile_memory_pipeline.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${var.schema}
@@ -59,7 +59,7 @@ resources:
             - task_key: task03_profile_memory_pipeline
           existing_cluster_id: ${var.cluster_id}
           notebook_task:
-            notebook_path: ../notebooks/04_explore_results.py
+            notebook_path: notebooks/04_explore_results.py
             base_parameters:
               catalog: ${var.catalog}
               schema: ${var.schema}

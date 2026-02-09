@@ -81,29 +81,6 @@ TBLPROPERTIES (
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create optional LLM error table
-# MAGIC
-# MAGIC This keeps malformed responses and parse failures for debugging.
-
-# COMMAND ----------
-
-spark.sql(
-    f"""
-CREATE TABLE IF NOT EXISTS {TABLES["llm_errors"]} (
-  user_id STRING,
-  emission_id STRING,
-  error_ts TIMESTAMP,
-  error_type STRING,
-  error_message STRING,
-  raw_response STRING
-)
-USING DELTA
-"""
-)
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Create current profile view
 # MAGIC
 # MAGIC The view resolves latest active fact per `user_id` + `key` with deterministic ordering.

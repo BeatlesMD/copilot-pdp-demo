@@ -74,7 +74,6 @@ If you do not want the wrapper script:
 
 - Table: `<catalog>.<schema>.conversation_events`
 - Table: `<catalog>.<schema>.profile_memory_audit`
-- Table: `<catalog>.<schema>.profile_memory_llm_errors` (optional diagnostics)
 - View: `<catalog>.<schema>.v_profile_memory_current`
 
 In `04_explore_results.py`, you should see:
@@ -95,7 +94,8 @@ In `04_explore_results.py`, you should see:
 ## Known caveats
 
 - Processing-time timers are less meaningful in `availableNow` mode; the message threshold is the primary trigger in one-shot demos.
-- If `openai` package or endpoint auth is unavailable, the pipeline uses a deterministic heuristic extractor fallback.
+- If `openai` package or endpoint auth is unavailable, the pipeline falls back to a deterministic heuristic extractor.
+- LLM fallback status is recorded in audit as `key='__llm_status__'` with `action='deleted'` so it does not appear in current-state view.
 - Bundles will fail deployment if `BUNDLE_VAR_cluster_id` is not set to a valid cluster.
 
 ## Troubleshooting

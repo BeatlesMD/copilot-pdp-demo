@@ -8,8 +8,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 if [[ -f ".env" ]]; then
-  # shellcheck disable=SC2046
-  export $(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
 fi
 
 if ! command -v databricks >/dev/null 2>&1; then
