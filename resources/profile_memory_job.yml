@@ -1,0 +1,73 @@
+resources:
+  jobs:
+    profile-memory-demo:
+      name: profile-memory-demo-${bundle.target}
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: task00_config
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ../notebooks/00_config.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              trigger_mode: ${var.trigger_mode}
+              checkpoint_suffix: ${var.checkpoint_suffix}
+
+        - task_key: task01_setup_tables
+          depends_on:
+            - task_key: task00_config
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ../notebooks/01_setup_tables.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              trigger_mode: ${var.trigger_mode}
+              checkpoint_suffix: ${var.checkpoint_suffix}
+
+        - task_key: task02_generate_data
+          depends_on:
+            - task_key: task01_setup_tables
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ../notebooks/02_generate_data.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              trigger_mode: ${var.trigger_mode}
+              checkpoint_suffix: ${var.checkpoint_suffix}
+
+        - task_key: task03_profile_memory_pipeline
+          depends_on:
+            - task_key: task02_generate_data
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ../notebooks/03_profile_memory_pipeline.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              trigger_mode: ${var.trigger_mode}
+              checkpoint_suffix: ${var.checkpoint_suffix}
+
+        - task_key: task04_explore_results
+          depends_on:
+            - task_key: task03_profile_memory_pipeline
+          existing_cluster_id: ${var.cluster_id}
+          notebook_task:
+            notebook_path: ../notebooks/04_explore_results.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              trigger_mode: ${var.trigger_mode}
+              checkpoint_suffix: ${var.checkpoint_suffix}
+
+      tags:
+        project: copilot-pdp-demo
+        pattern: profile-memory-audit-view
+
