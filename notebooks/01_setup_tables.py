@@ -81,6 +81,32 @@ TBLPROPERTIES (
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Create output table: AI-enriched current profile
+# MAGIC
+# MAGIC Secondary sink target table used by foreachBatch + MERGE upserts.
+
+# COMMAND ----------
+
+spark.sql(
+    f"""
+CREATE TABLE IF NOT EXISTS {TABLES["ai_enriched_current"]} (
+  user_id STRING,
+  `key` STRING,
+  kind STRING,
+  value STRING,
+  confidence DOUBLE,
+  ai_summary STRING,
+  source_emission_id STRING,
+  source_emission_ts TIMESTAMP,
+  updated_at TIMESTAMP
+)
+USING DELTA
+"""
+)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Create current profile view
 # MAGIC
 # MAGIC The view resolves latest active fact per `user_id` + `key` with deterministic ordering.

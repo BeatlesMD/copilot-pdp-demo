@@ -29,6 +29,5 @@ targets:
     mode: development
     default: true
     workspace:
-      host: ${env.DATABRICKS_HOST}
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
 

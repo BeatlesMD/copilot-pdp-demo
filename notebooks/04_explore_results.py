@@ -2,7 +2,9 @@
 # MAGIC %md
 # MAGIC # 04 - Explore Profile Memory Results
 # MAGIC
-# MAGIC This notebook provides demo-friendly queries to explain how memory is built and updated.
+# MAGIC This notebook is designed for a live demo walkthrough of both sinks:
+# MAGIC - Primary sink: profile facts in audit + current view
+# MAGIC - Secondary sink: AI-enriched summaries merged into a curated table
 
 # COMMAND ----------
 
@@ -16,9 +18,19 @@
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Pin session context
+
+# COMMAND ----------
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Current profile for alex_chen
 # MAGIC
-# MAGIC Look for durable preferences, identity facts, and project facts in the latest view.
+# MAGIC Talk track: show durable preferences, identity facts, and project facts in the latest view.
 
 # COMMAND ----------
 
@@ -38,7 +50,7 @@ ORDER BY `key`
 # MAGIC %md
 # MAGIC ## Audit trail for sam_patel location
 # MAGIC
-# MAGIC This should show location supersede from Brooklyn to Austin across emissions.
+# MAGIC Talk track: demonstrate supersede behavior (Brooklyn -> Austin) in append-only audit history.
 
 # COMMAND ----------
 
@@ -76,7 +88,7 @@ ORDER BY user_id, kind
 # MAGIC %md
 # MAGIC ## Contradiction and update handling
 # MAGIC
-# MAGIC Review how language preference evolved for alex_chen over time.
+# MAGIC Talk track: review how language preference evolves over time for the same key.
 
 # COMMAND ----------
 
@@ -96,7 +108,7 @@ ORDER BY emission_ts
 # MAGIC %md
 # MAGIC ## Emission timeline
 # MAGIC
-# MAGIC Each emission represents a profile snapshot for one user.
+# MAGIC Talk track: each emission ID is a profile snapshot event for one user.
 
 # COMMAND ----------
 
@@ -116,8 +128,28 @@ ORDER BY emission_ts, user_id
 # MAGIC %md
 # MAGIC ## Streaming state metrics (if available)
 # MAGIC
-# MAGIC In Databricks, use query details in the Streaming UI for RocksDB state size metrics.
+# MAGIC Optional: in Databricks Streaming UI, open query details for RocksDB state metrics.
 
 # COMMAND ----------
 
-display(spark.sql("SHOW TABLES"))
+display(spark.sql(f"SHOW TABLES IN {CATALOG}.{SCHEMA}"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Secondary sink output (AI summaries)
+# MAGIC
+# MAGIC Talk track: this table is produced by notebook `05_secondary_sink_ai_merge.py`
+# MAGIC using `foreachBatch` + `ai_query` + `MERGE`.
+
+# COMMAND ----------
+
+display(
+    spark.sql(
+        f"""
+SELECT user_id, `key`, value, ai_summary, confidence, source_emission_ts, updated_at
+FROM {TABLES["ai_enriched_current"]}
+ORDER BY updated_at DESC, user_id, `key`
+"""
+    )
+)

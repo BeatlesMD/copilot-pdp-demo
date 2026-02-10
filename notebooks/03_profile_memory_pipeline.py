@@ -16,13 +16,12 @@
 # COMMAND ----------
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
-from pyspark.sql import Row
+import pandas as pd
 from pyspark.sql.types import (
     ArrayType,
     DoubleType,
@@ -34,12 +33,7 @@ from pyspark.sql.types import (
 )
 
 try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-try:
-    from pyspark.sql.streaming.state import StatefulProcessor, StatefulProcessorHandle
+    from pyspark.sql.streaming import StatefulProcessor, StatefulProcessorHandle
 except Exception as exc:
     raise ImportError(
         "This demo requires Spark 4.x transformWithState APIs (DBR 16.x or newer)."
@@ -71,42 +65,12 @@ def clip_text(value: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
     text = WHITESPACE_RE.sub(" ", (value or "").strip())
     return text[:max_chars]
 
+# COMMAND ----------
 
-def resolve_runtime_auth() -> Tuple[str, str]:
-    host = os.environ.get("DATABRICKS_HOST", "").replace("https://", "").strip("/")
-    token = os.environ.get("DATABRICKS_TOKEN", "").strip()
-
-    # Driver-side Databricks context fallback.
-    try:
-        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-        if not host:
-            host = ctx.apiUrl().get().replace("https://", "").strip("/")
-        if not token:
-            token = ctx.apiToken().get()
-    except Exception:
-        pass
-
-    return host, token
-
-
-RUNTIME_WORKSPACE_HOST, RUNTIME_DATABRICKS_TOKEN = resolve_runtime_auth()
-
-
-def get_llm_client() -> Optional["OpenAI"]:
-    if OpenAI is None:
-        return None
-
-    host = RUNTIME_WORKSPACE_HOST
-    token = RUNTIME_DATABRICKS_TOKEN
-    if not host or not token:
-        return None
-
-    return OpenAI(
-        base_url=f"https://{host}/serving-endpoints",
-        api_key=token,
-        max_retries=3,
-        timeout=60.0,
-    )
+# MAGIC %md
+# MAGIC ## Fact normalization helpers
+# MAGIC
+# MAGIC These helpers validate keys, actions, and confidence before facts enter state.
 
 
 def system_prompt() -> str:
@@ -182,6 +146,13 @@ def normalize_fact(fact: Dict[str, object]) -> Optional[Dict[str, object]]:
         "action": action,
     }
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Heuristic extractor
+# MAGIC
+# MAGIC This fallback path keeps the demo functional even when an LLM is unavailable.
+
 
 def heuristic_extract(messages: List[Dict[str, str]], current_facts: Dict[str, Dict[str, object]]) -> Dict[str, object]:
     updates: Dict[str, Dict[str, object]] = {}
@@ -227,9 +198,16 @@ def heuristic_extract(messages: List[Dict[str, str]], current_facts: Dict[str, D
 
     return {"facts": list(updates.values())}
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## LLM call wrapper
+# MAGIC
+# MAGIC Currently configured to fall back to heuristics for worker stability.
+
 
 def call_llm(
-    client: Optional["OpenAI"], messages: List[Dict[str, str]], current_facts: Dict[str, Dict[str, object]]
+    client: Optional[object], messages: List[Dict[str, str]], current_facts: Dict[str, Dict[str, object]]
 ) -> Tuple[Dict[str, object], Optional[str]]:
     if client is None:
         return heuristic_extract(messages, current_facts), "llm_unavailable_heuristic_fallback"
@@ -305,60 +283,138 @@ output_schema = StructType(
     ]
 )
 
+value_string_state_schema = StructType([StructField("value", StringType(), True)])
+value_int_state_schema = StructType([StructField("value", IntegerType(), True)])
+
 
 class ProfileMemoryProcessor(StatefulProcessor):
+    @staticmethod
+    def _value_get(state):
+        raw = None
+        for name in ["getOption", "get_option", "get"]:
+            fn = getattr(state, name, None)
+            if fn:
+                raw = fn()
+                break
+        if raw is None:
+            return None
+        # ValueState in PySpark is typically a Row with one field.
+        if hasattr(raw, "asDict"):
+            d = raw.asDict(recursive=True)
+            return d.get("value")
+        if isinstance(raw, dict):
+            return raw.get("value")
+        if isinstance(raw, (tuple, list)) and len(raw) > 0:
+            return raw[0]
+        return None
+
+    @staticmethod
+    def _value_update(state, value):
+        state.update((value,))
+
+    @staticmethod
+    def _load_json(raw, default):
+        if raw is None or raw == "":
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+
     def init(self, handle: StatefulProcessorHandle) -> None:
-        self.message_buffer = handle.getListState("message_buffer", message_struct)
-        self.profile_facts = handle.getMapState("profile_facts", StringType(), fact_struct)
-        self.new_msg_count = handle.getValueState("new_msg_count", IntegerType())
-        self.llm_client = get_llm_client()
+        self.init_error = None
+        try:
+            # Use StructType payloads for ValueState compatibility.
+            self.buffer_json_state = handle.getValueState("message_buffer_json", value_string_state_schema)
+            self.facts_json_state = handle.getValueState("profile_facts_json", value_string_state_schema)
+            self.new_msg_count = handle.getValueState("new_msg_count", value_int_state_schema)
+        except Exception as exc:
+            self.init_error = f"state_init_error: {exc}"
 
-    def handleInputRows(self, key, rows, timer_values) -> Iterator[Row]:
-        user_id = key[0]
-        new_rows = list(rows)
-        if not new_rows:
-            return
+        # Keep processor workers network-free for runtime stability.
+        self.llm_client = None
 
-        self.message_buffer.appendList(new_rows)
-
-        all_msgs = list(self.message_buffer.get())
-        if len(all_msgs) > MESSAGE_BUFFER_SIZE:
-            self.message_buffer.clear()
-            self.message_buffer.appendList(all_msgs[-MESSAGE_BUFFER_SIZE:])
-
-        current_count = self.new_msg_count.getOption() or 0
-        user_turns = sum(1 for r in new_rows if r["role"] == "user")
-        current_count += user_turns
-        self.new_msg_count.update(current_count)
-
-        timer_values.register_processing_time_timer(
-            timer_values.get_current_processing_time_in_ms() + TIMER_TTL_MS
+    def _error_df(self, user_id: str, message: str, source_event_ids: Optional[List[str]] = None) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "user_id": user_id,
+                    "emission_id": str(uuid4()),
+                    "emission_ts": datetime.now(timezone.utc).replace(tzinfo=None),
+                    "key": "__processor_error__",
+                    "kind": "constraint",
+                    "value": clip_text(message, max_chars=500),
+                    "confidence": 1.0,
+                    "action": "deleted",
+                    "previous_value": None,
+                    "source_event_ids": source_event_ids or [],
+                }
+            ]
         )
 
-        if current_count >= EMISSION_THRESHOLD:
-            yield from self._emit_profile(user_id)
+    def _read_buffer(self) -> List[Dict[str, object]]:
+        return self._load_json(self._value_get(self.buffer_json_state), [])
 
-    def handleExpiredTimer(self, key, timer_values, expired_timer_info) -> Iterator[Row]:
+    def _write_buffer(self, buffer_rows: List[Dict[str, object]]) -> None:
+        self._value_update(self.buffer_json_state, json.dumps(buffer_rows, ensure_ascii=True))
+
+    def _read_facts(self) -> Dict[str, Dict[str, object]]:
+        return self._load_json(self._value_get(self.facts_json_state), {})
+
+    def _write_facts(self, facts: Dict[str, Dict[str, object]]) -> None:
+        self._value_update(self.facts_json_state, json.dumps(facts, ensure_ascii=True))
+
+    def handleInputRows(self, key, rows, timer_values) -> Iterator[pd.DataFrame]:
         user_id = key[0]
-        current_count = self.new_msg_count.getOption() or 0
-        if current_count > 0:
-            yield from self._emit_profile(user_id)
-        timer_values.register_processing_time_timer(
-            timer_values.get_current_processing_time_in_ms() + TIMER_TTL_MS
-        )
+        new_rows: List[Dict[str, object]] = []
+        try:
+            if self.init_error is not None:
+                yield self._error_df(user_id, self.init_error)
+                return
 
-    def _emit_profile(self, user_id: str) -> Iterator[Row]:
-        messages = [r.asDict(recursive=True) for r in list(self.message_buffer.get())]
-        source_event_ids = [m["event_id"] for m in messages[-10:]]
+            for pdf in rows:
+                if pdf is None or pdf.empty:
+                    continue
+                for _, series in pdf.iterrows():
+                    d = series.to_dict()
+                    ts = d.get("ts")
+                    if hasattr(ts, "isoformat"):
+                        d["ts"] = ts.isoformat()
+                    new_rows.append(d)
+            if not new_rows:
+                return
 
-        prior_facts = {k: v.asDict(recursive=True) for k, v in self.profile_facts.iterator()}
+            buffer_rows = self._read_buffer()
+            buffer_rows.extend(new_rows)
+            if len(buffer_rows) > MESSAGE_BUFFER_SIZE:
+                buffer_rows = buffer_rows[-MESSAGE_BUFFER_SIZE:]
+            self._write_buffer(buffer_rows)
+
+            current_count = self._value_get(self.new_msg_count) or 0
+            user_turns = sum(1 for r in new_rows if r.get("role") == "user")
+            self._value_update(self.new_msg_count, current_count + user_turns)
+
+            if (current_count + user_turns) >= EMISSION_THRESHOLD:
+                yield from self._emit_profile(user_id, buffer_rows)
+        except Exception as exc:
+            source_event_ids = [r.get("event_id") for r in new_rows[-10:] if r.get("event_id")]
+            yield self._error_df(user_id, f"handleInputRows error: {exc}", source_event_ids)
+
+    def handleExpiredTimer(self, key, timer_values, expired_timer_info) -> Iterator[pd.DataFrame]:
+        # Timer-driven emission is disabled for availableNow demo runs.
+        # Keep this as a generator to satisfy API expectations in PROCESS_TIMER/COMPLETE modes.
+        yield from ()
+
+    def _emit_profile(self, user_id: str, messages: List[Dict[str, object]]) -> Iterator[pd.DataFrame]:
+        source_event_ids = [m["event_id"] for m in messages[-10:] if m.get("event_id")]
+        prior_facts = self._read_facts()
         payload, llm_status = call_llm(self.llm_client, messages, prior_facts)
 
         emission_id = str(uuid4())
         emission_ts = datetime.now(timezone.utc).replace(tzinfo=None)
-
         action_by_key: Dict[str, str] = {}
-        deleted_rows: List[Row] = []
+        deleted_rows: List[Dict[str, object]] = []
+        current_facts = dict(prior_facts)
 
         for item in payload.get("facts", [])[:MAX_FACTS_PER_EMISSION]:
             normalized = normalize_fact(item if isinstance(item, dict) else {})
@@ -372,35 +428,32 @@ class ProfileMemoryProcessor(StatefulProcessor):
 
             if action == "deleted":
                 if prior is not None:
-                    self.profile_facts.remove(key)
+                    current_facts.pop(key, None)
                     deleted_rows.append(
-                        Row(
-                            user_id=user_id,
-                            emission_id=emission_id,
-                            emission_ts=emission_ts,
-                            key=key,
-                            kind=normalized["kind"],
-                            value=prior_value or "",
-                            confidence=normalized["confidence"],
-                            action="deleted",
-                            previous_value=prior_value,
-                            source_event_ids=source_event_ids,
-                        )
+                        {
+                            "user_id": user_id,
+                            "emission_id": emission_id,
+                            "emission_ts": emission_ts,
+                            "key": key,
+                            "kind": normalized["kind"],
+                            "value": prior_value or "",
+                            "confidence": normalized["confidence"],
+                            "action": "deleted",
+                            "previous_value": prior_value,
+                            "source_event_ids": source_event_ids,
+                        }
                     )
                 continue
 
             if normalized["confidence"] < CONFIDENCE_THRESHOLD:
                 continue
 
-            self.profile_facts.update(
-                key,
-                Row(
-                    key=key,
-                    kind=normalized["kind"],
-                    value=normalized["value"],
-                    confidence=float(normalized["confidence"]),
-                ),
-            )
+            current_facts[key] = {
+                "key": key,
+                "kind": normalized["kind"],
+                "value": normalized["value"],
+                "confidence": float(normalized["confidence"]),
+            }
 
             if prior is None:
                 action_by_key[key] = "new"
@@ -409,44 +462,54 @@ class ProfileMemoryProcessor(StatefulProcessor):
             else:
                 action_by_key[key] = "unchanged"
 
-        for row in deleted_rows:
-            yield row
+        self._write_facts(current_facts)
+
+        if deleted_rows:
+            yield pd.DataFrame(deleted_rows)
 
         if llm_status is not None:
-            yield Row(
-                user_id=user_id,
-                emission_id=emission_id,
-                emission_ts=emission_ts,
-                key="__llm_status__",
-                kind="constraint",
-                value=llm_status,
-                confidence=1.0,
-                action="deleted",
-                previous_value=None,
-                source_event_ids=source_event_ids,
+            yield pd.DataFrame(
+                [
+                    {
+                        "user_id": user_id,
+                        "emission_id": emission_id,
+                        "emission_ts": emission_ts,
+                        "key": "__llm_status__",
+                        "kind": "constraint",
+                        "value": llm_status,
+                        "confidence": 1.0,
+                        "action": "deleted",
+                        "previous_value": None,
+                        "source_event_ids": source_event_ids,
+                    }
+                ]
             )
 
-        current = {k: v.asDict(recursive=True) for k, v in self.profile_facts.iterator()}
-        for key, fact in current.items():
+        snapshot_rows: List[Dict[str, object]] = []
+        for key, fact in current_facts.items():
             action = action_by_key.get(key, "unchanged")
-            yield Row(
-                user_id=user_id,
-                emission_id=emission_id,
-                emission_ts=emission_ts,
-                key=key,
-                kind=fact["kind"],
-                value=fact["value"],
-                confidence=float(fact["confidence"]),
-                action=action,
-                previous_value=(
-                    prior_facts[key].get("value")
-                    if action == "updated" and prior_facts.get(key) is not None
-                    else None
-                ),
-                source_event_ids=source_event_ids,
+            snapshot_rows.append(
+                {
+                    "user_id": user_id,
+                    "emission_id": emission_id,
+                    "emission_ts": emission_ts,
+                    "key": key,
+                    "kind": fact["kind"],
+                    "value": fact["value"],
+                    "confidence": float(fact["confidence"]),
+                    "action": action,
+                    "previous_value": (
+                        prior_facts[key].get("value")
+                        if action == "updated" and prior_facts.get(key) is not None
+                        else None
+                    ),
+                    "source_event_ids": source_event_ids,
+                }
             )
+        if snapshot_rows:
+            yield pd.DataFrame(snapshot_rows)
 
-        self.new_msg_count.update(0)
+        self._value_update(self.new_msg_count, 0)
 
     def close(self) -> None:
         return
@@ -465,11 +528,35 @@ spark.conf.set(
     "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider",
 )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Checkpoint handling
+# MAGIC
+# MAGIC For iterative debugging, you can keep checkpoint state by setting `clear_checkpoint=false`.
+
+# COMMAND ----------
+
+if CLEAR_CHECKPOINT:
+    dbutils.fs.rm(CHECKPOINT_PATH, recurse=True)
+    print("Checkpoint cleared:", CHECKPOINT_PATH)
+else:
+    print("Checkpoint retained:", CHECKPOINT_PATH)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Build streaming query
+# MAGIC
+# MAGIC This cell only defines the query builder so you can inspect settings before starting it.
+
+# COMMAND ----------
+
 source_df = spark.readStream.table(TABLES["conversation_events"])
 
 stream_builder = (
     source_df.groupBy("user_id")
-    .transformWithState(
+    .transformWithStateInPandas(
         statefulProcessor=ProfileMemoryProcessor(),
         outputStructType=output_schema,
         outputMode="append",
@@ -485,8 +572,20 @@ if TRIGGER_MODE == "availableNow":
 else:
     stream_builder = stream_builder.trigger(processingTime=PROCESSING_TIME_TRIGGER)
 
-query = stream_builder.toTable(TABLES["profile_memory_audit"])
-query.awaitTermination()
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Start stream (optional)
+# MAGIC
+# MAGIC Set widget `run_stream=false` when you want to debug notebook cells without launching streaming execution.
+
+# COMMAND ----------
+
+if RUN_STREAM:
+    query = stream_builder.toTable(TABLES["profile_memory_audit"])
+    query.awaitTermination()
+else:
+    print("RUN_STREAM is false; query was built but not started.")
 
 # COMMAND ----------
 

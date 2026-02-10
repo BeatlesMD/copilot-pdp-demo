@@ -8,6 +8,7 @@ Profile Memory demo using Spark `transformWithState`, RocksDB-backed state, Mode
 - `notebooks/01_setup_tables.py` schema + input/output tables + current-state view
 - `notebooks/02_generate_data.py` deterministic synthetic conversation events
 - `notebooks/03_profile_memory_pipeline.py` stateful streaming pipeline
+- `notebooks/05_secondary_sink_ai_merge.py` secondary sink using `foreachBatch` + `ai_query` + `MERGE`
 - `notebooks/04_explore_results.py` demo queries and validation views
 - `databricks.yml` Databricks Asset Bundle root config
 - `resources/profile_memory_job.yml` multi-task job definition
@@ -23,7 +24,8 @@ Profile Memory demo using Spark `transformWithState`, RocksDB-backed state, Mode
    - processing-time timer for TTL-based emission
 3. On threshold or timer, the pipeline calls a Model Serving endpoint and updates profile facts.
 4. Emissions append to `profile_memory_audit`.
-5. `v_profile_memory_current` resolves latest active fact per `user_id` + `key`.
+5. Secondary stream consumes `profile_memory_audit`, applies `ai_query`, and merges into `profile_memory_ai_current`.
+6. `v_profile_memory_current` resolves latest active fact per `user_id` + `key`.
 
 ## Prerequisites
 
@@ -43,7 +45,8 @@ Run notebooks in this order:
 2. `notebooks/01_setup_tables.py`
 3. `notebooks/02_generate_data.py`
 4. `notebooks/03_profile_memory_pipeline.py`
-5. `notebooks/04_explore_results.py`
+5. `notebooks/05_secondary_sink_ai_merge.py`
+6. `notebooks/04_explore_results.py`
 
 Default trigger mode is `availableNow`. For live streaming style runs, set widget `trigger_mode` to `processingTime`.
 
@@ -74,6 +77,7 @@ If you do not want the wrapper script:
 
 - Table: `<catalog>.<schema>.conversation_events`
 - Table: `<catalog>.<schema>.profile_memory_audit`
+- Table: `<catalog>.<schema>.profile_memory_ai_current`
 - View: `<catalog>.<schema>.v_profile_memory_current`
 
 In `04_explore_results.py`, you should see:

@@ -23,12 +23,16 @@ dbutils.widgets.text("schema", "memory_demo", "Schema")
 dbutils.widgets.text("llm_endpoint", "databricks-meta-llama-3-1-70b-instruct", "LLM Endpoint")
 dbutils.widgets.text("trigger_mode", "availableNow", "Trigger Mode (availableNow|processingTime)")
 dbutils.widgets.text("checkpoint_suffix", "dev", "Checkpoint Suffix")
+dbutils.widgets.dropdown("run_stream", "true", ["true", "false"], "Run Stream")
+dbutils.widgets.dropdown("clear_checkpoint", "true", ["true", "false"], "Clear Checkpoint")
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 SCHEMA = dbutils.widgets.get("schema").strip()
 LLM_ENDPOINT = dbutils.widgets.get("llm_endpoint").strip()
 TRIGGER_MODE = dbutils.widgets.get("trigger_mode").strip()
 CHECKPOINT_SUFFIX = dbutils.widgets.get("checkpoint_suffix").strip() or "dev"
+RUN_STREAM = dbutils.widgets.get("run_stream").strip().lower() == "true"
+CLEAR_CHECKPOINT = dbutils.widgets.get("clear_checkpoint").strip().lower() == "true"
 
 # COMMAND ----------
 
@@ -58,6 +62,7 @@ TABLES: Dict[str, str] = {
     "conversation_events": fq("conversation_events"),
     "profile_memory_audit": fq("profile_memory_audit"),
     "current_view": fq("v_profile_memory_current"),
+    "ai_enriched_current": fq("profile_memory_ai_current"),
 }
 
 # COMMAND ----------
@@ -74,5 +79,7 @@ print("SCHEMA:", SCHEMA)
 print("LLM_ENDPOINT:", LLM_ENDPOINT)
 print("TRIGGER_MODE:", TRIGGER_MODE)
 print("CHECKPOINT_SUFFIX:", CHECKPOINT_SUFFIX)
+print("RUN_STREAM:", RUN_STREAM)
+print("CLEAR_CHECKPOINT:", CLEAR_CHECKPOINT)
 print("CHECKPOINT_PATH:", CHECKPOINT_PATH)
 print("TABLES:", TABLES)
